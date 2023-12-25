@@ -84,6 +84,9 @@ use std::collections::hash_map::{
 use std::convert::Infallible;
 use std::rc::Rc;
 
+#[cfg(feature = "test_vectors")]
+use crate::test_vector::*;
+
 // CONSTANTS & SETTINGS //////////////////////////
 
 /// Size required to fit any message in binary form
@@ -158,146 +161,6 @@ pub type XAEADNonce = Public<{ xaead::NONCE_LEN }>;
 pub type MsgBuf = Public<MAX_MESSAGE_LEN>;
 
 pub type PeerNo = usize;
-
-#[cfg(feature = "test_vectors")]
-#[derive(Debug)]
-pub struct TestHarness {
-    pub test_vector: Option<Rc<TestVector>>
-}
-
-#[cfg(feature = "test_vectors")]
-impl TestHarness {
-    fn new() -> Self {
-        Self {
-            test_vector: None
-        }
-    }
-
-    fn overwrite_nonce(&self, n: &mut XAEADNonce) {
-        if let Some(test_vector) = &self.test_vector {
-            *n = test_vector.biscuit_nonce;
-        }
-    }
-
-    fn overwrite_sidi(&self, sidi: &mut SessionId) {
-        if let Some(test_vector) = &self.test_vector {
-            sidi.clone_from(&test_vector.sidi);
-        }
-    }
-
-    fn overwrite_ephemeral_keys(&self, eski: &mut ESk, epki: &mut EPk) {
-        if let Some(test_vector) = &self.test_vector {
-            eski.clone_from(&test_vector.eski);
-            epki.clone_from(&test_vector.epki);
-        }
-    }
-
-    fn overwrite_sctr_and_mix(&self, core: &mut HandshakeState, sctr: &mut [u8], spkt: &[u8]) {
-        if let Some(test_vector) = &self.test_vector {
-            sctr.copy_from_slice(test_vector.sctr.as_ref());
-            core.mix(spkt).unwrap().mix(test_vector.shk1.secret()).unwrap().mix(sctr).unwrap();
-        } else {
-            core.encaps_and_mix::<StaticKem, { StaticKem::SHK_LEN }>(sctr, spkt).unwrap();
-        }
-    }
-
-    fn overwrite_sidr(&self, sidr: &mut SessionId) {
-        if let Some(test_vector) = &self.test_vector {
-            sidr.clone_from(&test_vector.sidr);
-        }
-    }
-
-    fn overwrite_ecti_and_mix(&self, core: &mut HandshakeState, ecti: &mut [u8], epki: &[u8]) {
-        if let Some(test_vector) = &self.test_vector {
-            ecti.copy_from_slice(test_vector.ecti.as_ref());
-            core.mix(epki).unwrap().mix(test_vector.shk2.secret()).unwrap().mix(ecti).unwrap();
-        } else {
-            core.encaps_and_mix::<EphemeralKem, { EphemeralKem::SHK_LEN }>(ecti, epki).unwrap();
-        }
-    }
-
-    fn overwrite_scti_and_mix(&self, core: &mut HandshakeState, scti: &mut [u8], spkt: &[u8]) {
-        if let Some(test_vector) = &self.test_vector {
-            scti.copy_from_slice(test_vector.scti.as_ref());
-            core.mix(spkt).unwrap().mix(test_vector.shk3.secret()).unwrap().mix(scti).unwrap();
-        } else {
-            core.encaps_and_mix::<StaticKem, { StaticKem::SHK_LEN }>(scti, spkt).unwrap();
-        }
-    }
-}
-
-#[cfg(feature = "test_vectors")]
-/// Struct representing a test vector
-///
-/// Holds custom input and corresponding expected output values
-#[derive(Clone, Debug)]
-pub struct TestVector {
-    // Custom Input Values
-    pub eski: ESk,
-    pub epki: EPk,
-    pub sidi: SessionId,
-    pub sidr: SessionId,
-    pub biscuit_nonce: XAEADNonce,
-
-    pub shk1: Secret<{ StaticKem::SHK_LEN }>,
-    pub sctr: [u8; StaticKem::CT_LEN],
-
-    pub shk2: Secret<{ EphemeralKem::SHK_LEN }>,
-    pub ecti: [u8; EphemeralKem::CT_LEN],
-
-    pub shk3: Secret<{ StaticKem::SHK_LEN }>,
-    pub scti: [u8; StaticKem::CT_LEN],
-
-    // Expected intermediate chaining keys
-    // e.g., expected_chaining_keys["IHI4"] contains expected chaining key after processing "IHI4"
-    pub expected_chaining_keys: HashMap<String, Secret<KEY_LEN>>,
-
-    // Expected output shared key
-    pub expected_osk: SymKey,
-}
-
-#[cfg(feature = "test_vectors")]
-impl TestVector {
-    fn new(
-        eski: ESk,
-        epki: EPk,
-        sidi: SessionId,
-        sidr: SessionId,
-        shk1: Secret<{ StaticKem::SHK_LEN }>,
-        sctr: [u8; StaticKem::CT_LEN],
-        shk2: Secret<{ EphemeralKem::SHK_LEN }>,
-        ecti: [u8; EphemeralKem::CT_LEN],
-        shk3: Secret<{ StaticKem::SHK_LEN }>,
-        scti: [u8; StaticKem::CT_LEN],
-        biscuit_nonce: XAEADNonce,
-        expected_chaining_keys: HashMap<String, Secret<KEY_LEN>>,
-        expected_osk: SymKey) -> Self {
-        Self {
-            eski,
-            epki,
-            sidi,
-            sidr,
-            shk1,
-            sctr,
-            shk2,
-            ecti,
-            shk3,
-            scti,
-            biscuit_nonce,
-            expected_chaining_keys,
-            expected_osk
-        }
-    }
-
-    fn check_chaining_key(&self, ck: SecretHashDomainNamespace, handshake_step_id: &str) {
-        let ck_secret = ck.danger_into_secret();
-        assert_eq!(ck_secret.secret(), self.expected_chaining_keys[handshake_step_id].secret());
-    }
-
-    fn check_osk(&self, osk: SymKey) {
-        assert_eq!(osk.secret(), self.expected_osk.secret());
-    }
-}
 
 /// Implementation of the cryptographic protocol
 ///
@@ -1617,7 +1480,11 @@ impl CryptoServer {
         // IHI4
         hs.core.mix(ih.sidi())?.mix(ih.epki())?;
 
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.check_chaining_key(&hs.core.ck, "IHI4");
+
         // IHI5
+        // TODO: this is horrible, change it
         #[cfg(not(feature = "test_vectors"))]
         hs.core
             .encaps_and_mix::<StaticKem, { StaticKem::SHK_LEN }>(
@@ -1633,13 +1500,22 @@ impl CryptoServer {
         hs.core
             .encrypt_and_mix(ih.pidic_mut(), self.pidm()?.as_ref())?;
 
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.check_chaining_key(&hs.core.ck, "IHI6");
+
         // IHI7
         hs.core
             .mix(self.spkm.secret())?
             .mix(peer.get(self).psk.secret())?;
 
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.check_chaining_key(&hs.core.ck, "IHI7");
+
         // IHI8
         hs.core.encrypt_and_mix(ih.auth_mut(), &[])?;
+
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.check_chaining_key(&hs.core.ck, "IHI8");
 
         // Update the handshake hash last (not changing any state on prior error
         peer.hs().insert(self, hs)?;
@@ -1662,12 +1538,18 @@ impl CryptoServer {
         // IHR4
         core.mix(ih.sidi())?.mix(ih.epki())?;
 
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.check_chaining_key(&core.ck, "IHR4");
+
         // IHR5
         core.decaps_and_mix::<StaticKem, { StaticKem::SHK_LEN }>(
             self.sskm.secret(),
             self.spkm.secret(),
             ih.sctr(),
         )?;
+
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.check_chaining_key(&core.ck, "IHR5");
 
         // IHR6
         let peer = {
@@ -1677,12 +1559,21 @@ impl CryptoServer {
                 .with_context(|| format!("No such peer {peerid:?}."))?
         };
 
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.check_chaining_key(&core.ck, "IHR6");
+
         // IHR7
         core.mix(peer.get(self).spkt.secret())?
             .mix(peer.get(self).psk.secret())?;
 
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.check_chaining_key(&core.ck, "IHR7");
+
         // IHR8
         core.decrypt_and_mix(&mut [0u8; 0], ih.auth())?;
+
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.check_chaining_key(&core.ck, "IHR8");
 
         // RHR1
         core.sidr.randomize();
@@ -1696,12 +1587,18 @@ impl CryptoServer {
         // RHR3
         core.mix(rh.sidr())?.mix(rh.sidi())?;
 
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.check_chaining_key(&core.ck, "RHR3");
+
         // RHR4
         #[cfg(not(feature = "test_vectors"))]
         core.encaps_and_mix::<EphemeralKem, { EphemeralKem::SHK_LEN }>(rh.ecti_mut(), ih.epki())?;
 
         #[cfg(feature = "test_vectors")]
-        self.test_harness.overwrite_ecti_and_mix(&mut core, rh.ecti_mut(), ih.epki());
+        {
+            self.test_harness.overwrite_ecti_and_mix(&mut core, rh.ecti_mut(), ih.epki());
+            self.test_harness.check_chaining_key(&core.ck, "RHR4");
+        }
 
         // RHR5
         #[cfg(not(feature = "test_vectors"))]
@@ -1711,13 +1608,19 @@ impl CryptoServer {
         )?;
 
         #[cfg(feature = "test_vectors")]
-        self.test_harness.overwrite_scti_and_mix(&mut core, rh.scti_mut(), peer.get(self).spkt.secret());
+        {
+            self.test_harness.overwrite_scti_and_mix(&mut core, rh.scti_mut(), peer.get(self).spkt.secret());
+            self.test_harness.check_chaining_key(&core.ck, "RHR5");
+        }
 
         // RHR6
         core.store_biscuit(self, peer, rh.biscuit_mut())?;
 
         // RHR7
         core.encrypt_and_mix(rh.auth_mut(), &[])?;
+
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.check_chaining_key(&core.ck, "RHR7");
 
         Ok(peer)
     }
@@ -1772,12 +1675,18 @@ impl CryptoServer {
         // RHI3
         core.mix(rh.sidr())?.mix(rh.sidi())?;
 
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.check_chaining_key(&core.ck, "RHI3");
+
         // RHI4
         core.decaps_and_mix::<EphemeralKem, { EphemeralKem::SHK_LEN }>(
             hs!().eski.secret(),
             &*hs!().epki,
             rh.ecti(),
         )?;
+
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.check_chaining_key(&core.ck, "RHI4");
 
         // RHI5
         core.decaps_and_mix::<StaticKem, { StaticKem::SHK_LEN }>(
@@ -1786,11 +1695,20 @@ impl CryptoServer {
             rh.scti(),
         )?;
 
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.check_chaining_key(&core.ck, "RHI5");
+
         // RHI6
         core.mix(rh.biscuit())?;
 
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.check_chaining_key(&core.ck, "RHI6");
+
         // RHI7
         core.decrypt_and_mix(&mut [0u8; 0], rh.auth())?;
+
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.check_chaining_key(&core.ck, "RHI7");
 
         // TODO: We should just authenticate the entire network package up to the auth
         // tag as a pattern instead of mixing in fields separately
@@ -1802,8 +1720,14 @@ impl CryptoServer {
         core.mix(ic.sidi())?.mix(ic.sidr())?;
         ic.biscuit_mut().copy_from_slice(rh.biscuit());
 
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.check_chaining_key(&core.ck, "ICI3");
+
         // ICI4
         core.encrypt_and_mix(ic.auth_mut(), &[])?;
+
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.check_chaining_key(&core.ck, "ICI4");
 
         // Split() – We move the secrets into the session; we do not
         // delete the InitiatorHandshake, just clear it's secrets because
@@ -1835,11 +1759,20 @@ impl CryptoServer {
         // ICR2
         core.encrypt_and_mix(&mut [0u8; aead::TAG_LEN], &[])?;
 
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.check_chaining_key(&core.ck, "ICR2");
+
         // ICR3
         core.mix(ic.sidi())?.mix(ic.sidr())?;
 
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.check_chaining_key(&core.ck, "ICR3");
+
         // ICR4
         core.decrypt_and_mix(&mut [0u8; 0], ic.auth())?;
+
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.check_chaining_key(&core.ck, "ICR4");
 
         // ICR5
         if rosenpass_sodium::helpers::compare(&*biscuit_no, &*peer.get(self).biscuit_used) > 0 {
@@ -2015,18 +1948,28 @@ mod test {
 
     #[test]
     #[cfg(feature = "test_vectors")]
+    /// Perform two key exchanges via `perform_deterministic_exchange` given the same inputs and
+    /// assert that they are indeed equal
     fn deterministic_osk() {
         rosenpass_sodium::init().unwrap();
 
         stacker::grow(8 * 1024 * 1024, || {
+
+            // Generate ephemeral key for initiator
             let (mut sk, mut pk) = (ESk::zero(), EPk::zero());
             EphemeralKem::keygen(sk.secret_mut(), &mut *pk).unwrap();
+
+            // Generate session ids
             let (mut sidi, mut sidr) = (SessionId::zero(), SessionId::zero());
             sidi.randomize(); sidr.randomize();
 
             let psk = SymKey::random();
+
+            // Generate static key pairs for the two servers
             let ((sk_me, pk_me), (sk_they, pk_they)) = (keygen().unwrap(), keygen().unwrap());
 
+            // Generate the different shared secrets that are randomly generated during the
+            // handshake and the corresponding ciphertexts
             let mut sshk1 = Secret::<{ StaticKem::SHK_LEN }>::zero();
             let mut sshk2 = Secret::<{ StaticKem::SHK_LEN }>::zero();
             let mut eshk = Secret::<{ StaticKem::SHK_LEN }>::zero();
@@ -2067,6 +2010,8 @@ mod test {
         });
     }
 
+    /// Perform a key exchange using fixed input parameters to obtain a deterministic output shared
+    /// key
     fn perform_deterministic_exchange(
         ssk_me: SSk,
         spk_me: SPk,

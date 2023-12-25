@@ -7,6 +7,9 @@ pub mod hash_domains;
 pub mod msgs;
 pub mod protocol;
 
+#[cfg(feature = "test_vectors")]
+pub mod test_vector;
+
 #[derive(thiserror::Error, Debug)]
 pub enum RosenpassError {
     #[error("buffer size mismatch")]
