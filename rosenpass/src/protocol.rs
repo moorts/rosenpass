@@ -82,6 +82,7 @@ use std::collections::hash_map::{
     HashMap,
 };
 use std::convert::Infallible;
+use std::rc::Rc;
 
 // CONSTANTS & SETTINGS //////////////////////////
 
@@ -158,6 +159,146 @@ pub type MsgBuf = Public<MAX_MESSAGE_LEN>;
 
 pub type PeerNo = usize;
 
+#[cfg(feature = "test_vectors")]
+#[derive(Debug)]
+pub struct TestHarness {
+    pub test_vector: Option<Rc<TestVector>>
+}
+
+#[cfg(feature = "test_vectors")]
+impl TestHarness {
+    fn new() -> Self {
+        Self {
+            test_vector: None
+        }
+    }
+
+    fn overwrite_nonce(&self, n: &mut XAEADNonce) {
+        if let Some(test_vector) = &self.test_vector {
+            *n = test_vector.biscuit_nonce;
+        }
+    }
+
+    fn overwrite_sidi(&self, sidi: &mut SessionId) {
+        if let Some(test_vector) = &self.test_vector {
+            sidi.clone_from(&test_vector.sidi);
+        }
+    }
+
+    fn overwrite_ephemeral_keys(&self, eski: &mut ESk, epki: &mut EPk) {
+        if let Some(test_vector) = &self.test_vector {
+            eski.clone_from(&test_vector.eski);
+            epki.clone_from(&test_vector.epki);
+        }
+    }
+
+    fn overwrite_sctr_and_mix(&self, core: &mut HandshakeState, sctr: &mut [u8], spkt: &[u8]) {
+        if let Some(test_vector) = &self.test_vector {
+            sctr.copy_from_slice(test_vector.sctr.as_ref());
+            core.mix(spkt).unwrap().mix(test_vector.shk1.secret()).unwrap().mix(sctr).unwrap();
+        } else {
+            core.encaps_and_mix::<StaticKem, { StaticKem::SHK_LEN }>(sctr, spkt).unwrap();
+        }
+    }
+
+    fn overwrite_sidr(&self, sidr: &mut SessionId) {
+        if let Some(test_vector) = &self.test_vector {
+            sidr.clone_from(&test_vector.sidr);
+        }
+    }
+
+    fn overwrite_ecti_and_mix(&self, core: &mut HandshakeState, ecti: &mut [u8], epki: &[u8]) {
+        if let Some(test_vector) = &self.test_vector {
+            ecti.copy_from_slice(test_vector.ecti.as_ref());
+            core.mix(epki).unwrap().mix(test_vector.shk2.secret()).unwrap().mix(ecti).unwrap();
+        } else {
+            core.encaps_and_mix::<EphemeralKem, { EphemeralKem::SHK_LEN }>(ecti, epki).unwrap();
+        }
+    }
+
+    fn overwrite_scti_and_mix(&self, core: &mut HandshakeState, scti: &mut [u8], spkt: &[u8]) {
+        if let Some(test_vector) = &self.test_vector {
+            scti.copy_from_slice(test_vector.scti.as_ref());
+            core.mix(spkt).unwrap().mix(test_vector.shk3.secret()).unwrap().mix(scti).unwrap();
+        } else {
+            core.encaps_and_mix::<StaticKem, { StaticKem::SHK_LEN }>(scti, spkt).unwrap();
+        }
+    }
+}
+
+#[cfg(feature = "test_vectors")]
+/// Struct representing a test vector
+///
+/// Holds custom input and corresponding expected output values
+#[derive(Clone, Debug)]
+pub struct TestVector {
+    // Custom Input Values
+    pub eski: ESk,
+    pub epki: EPk,
+    pub sidi: SessionId,
+    pub sidr: SessionId,
+    pub biscuit_nonce: XAEADNonce,
+
+    pub shk1: Secret<{ StaticKem::SHK_LEN }>,
+    pub sctr: [u8; StaticKem::CT_LEN],
+
+    pub shk2: Secret<{ EphemeralKem::SHK_LEN }>,
+    pub ecti: [u8; EphemeralKem::CT_LEN],
+
+    pub shk3: Secret<{ StaticKem::SHK_LEN }>,
+    pub scti: [u8; StaticKem::CT_LEN],
+
+    // Expected intermediate chaining keys
+    // e.g., expected_chaining_keys["IHI4"] contains expected chaining key after processing "IHI4"
+    pub expected_chaining_keys: HashMap<String, Secret<KEY_LEN>>,
+
+    // Expected output shared key
+    pub expected_osk: SymKey,
+}
+
+#[cfg(feature = "test_vectors")]
+impl TestVector {
+    fn new(
+        eski: ESk,
+        epki: EPk,
+        sidi: SessionId,
+        sidr: SessionId,
+        shk1: Secret<{ StaticKem::SHK_LEN }>,
+        sctr: [u8; StaticKem::CT_LEN],
+        shk2: Secret<{ EphemeralKem::SHK_LEN }>,
+        ecti: [u8; EphemeralKem::CT_LEN],
+        shk3: Secret<{ StaticKem::SHK_LEN }>,
+        scti: [u8; StaticKem::CT_LEN],
+        biscuit_nonce: XAEADNonce,
+        expected_chaining_keys: HashMap<String, Secret<KEY_LEN>>,
+        expected_osk: SymKey) -> Self {
+        Self {
+            eski,
+            epki,
+            sidi,
+            sidr,
+            shk1,
+            sctr,
+            shk2,
+            ecti,
+            shk3,
+            scti,
+            biscuit_nonce,
+            expected_chaining_keys,
+            expected_osk
+        }
+    }
+
+    fn check_chaining_key(&self, ck: SecretHashDomainNamespace, handshake_step_id: &str) {
+        let ck_secret = ck.danger_into_secret();
+        assert_eq!(ck_secret.secret(), self.expected_chaining_keys[handshake_step_id].secret());
+    }
+
+    fn check_osk(&self, osk: SymKey) {
+        assert_eq!(osk.secret(), self.expected_osk.secret());
+    }
+}
+
 /// Implementation of the cryptographic protocol
 ///
 /// The scope of this is:
@@ -185,7 +326,19 @@ pub struct CryptoServer {
 
     // Tick handling
     pub peer_poll_off: usize,
+
+    #[cfg(feature = "test_vectors")]
+    pub test_harness: TestHarness,
 }
+
+#[cfg(feature = "test_vectors")]
+impl CryptoServer {
+    fn set_test_vector(&mut self, test_vector: Rc<TestVector>) {
+        self.test_harness.test_vector = Some(test_vector);
+    }
+
+}
+
 
 /// A Biscuit is like a fancy cookie. To avoid state disruption attacks,
 /// the responder doesn't store state. Instead the state is stored in a
@@ -196,6 +349,16 @@ pub struct CryptoServer {
 pub struct BiscuitKey {
     pub created_at: Timing,
     pub key: SymKey,
+}
+
+#[cfg(feature = "test_vectors")]
+impl Clone for BiscuitKey {
+    fn clone(&self) -> BiscuitKey {
+        BiscuitKey {
+            created_at: self.created_at,
+            key: self.key.clone(),
+        }
+    }
 }
 
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -450,6 +613,9 @@ impl CryptoServer {
             peers: Vec::new(),
             index: HashMap::new(),
             peer_poll_off: 0,
+
+            #[cfg(feature = "test_vectors")]
+            test_harness: TestHarness::new(),
         }
     }
 
@@ -563,6 +729,7 @@ impl CryptoServer {
         // Return the youngest but only if it's youthful
         // first being returned in case of a tie
         let r = if t >= u { a } else { b };
+
         if r.lifecycle(self) == Lifecycle::Young {
             return r;
         }
@@ -571,6 +738,7 @@ impl CryptoServer {
         // last one being reaped in case of a tie
         let r = if t < u { a } else { b };
         let tb = self.timebase.clone();
+        #[cfg(not(feature = "test_vectors"))]
         r.get_mut(self).randomize(&tb);
         r
     }
@@ -1299,6 +1467,7 @@ impl HandshakeState {
             .mix(self.sidr.as_slice())?
             .into_value();
 
+
         // consume biscuit no
         rosenpass_sodium::helpers::increment(&mut *srv.biscuit_ctr);
 
@@ -1306,11 +1475,16 @@ impl HandshakeState {
         // TODO: This is premature optimization. Remove!
         let bk = srv.active_biscuit_key();
         let mut n = XAEADNonce::random();
+
+        #[cfg(feature = "test_vectors")]
+        srv.test_harness.overwrite_nonce(&mut n);
+
         n[0] &= 0b0111_1111;
         n[0] |= (bk.0 as u8 & 0x1) << 7;
 
         let k = bk.get(srv).key.secret();
         let pt = biscuit.all_bytes();
+
         xaead::encrypt(biscuit_ct, k, &*n, &ad, pt)?;
 
         self.mix(biscuit_ct)
@@ -1348,6 +1522,7 @@ impl HandshakeState {
         let no = BiscuitId::from_slice(biscuit.biscuit_no());
         let ck = SecretHashDomain::danger_from_secret(Secret::from_slice(biscuit.ck())).dup();
         let pid = PeerId::from_slice(biscuit.pidi());
+
 
         // Reconstruct the handshake state
         let mut hs = Self { sidi, sidr, ck };
@@ -1424,21 +1599,35 @@ impl CryptoServer {
 
         // IHI2
         hs.core.sidi.randomize();
+
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.overwrite_sidi(&mut hs.core.sidi);
+
         ih.sidi_mut().copy_from_slice(&hs.core.sidi.value);
 
         // IHI3
         EphemeralKem::keygen(hs.eski.secret_mut(), &mut *hs.epki)?;
+
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.overwrite_ephemeral_keys(&mut hs.eski, &mut hs.epki);
+
         ih.epki_mut().copy_from_slice(&hs.epki.value);
+
 
         // IHI4
         hs.core.mix(ih.sidi())?.mix(ih.epki())?;
 
         // IHI5
+        #[cfg(not(feature = "test_vectors"))]
         hs.core
             .encaps_and_mix::<StaticKem, { StaticKem::SHK_LEN }>(
                 ih.sctr_mut(),
                 peer.get(self).spkt.secret(),
             )?;
+
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.overwrite_sctr_and_mix(&mut hs.core, ih.sctr_mut(), peer.get(self).spkt.secret());
+
 
         // IHI6
         hs.core
@@ -1497,6 +1686,10 @@ impl CryptoServer {
 
         // RHR1
         core.sidr.randomize();
+
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.overwrite_sidr(&mut core.sidr);
+
         rh.sidi_mut().copy_from_slice(core.sidi.as_ref());
         rh.sidr_mut().copy_from_slice(core.sidr.as_ref());
 
@@ -1504,13 +1697,21 @@ impl CryptoServer {
         core.mix(rh.sidr())?.mix(rh.sidi())?;
 
         // RHR4
+        #[cfg(not(feature = "test_vectors"))]
         core.encaps_and_mix::<EphemeralKem, { EphemeralKem::SHK_LEN }>(rh.ecti_mut(), ih.epki())?;
 
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.overwrite_ecti_and_mix(&mut core, rh.ecti_mut(), ih.epki());
+
         // RHR5
+        #[cfg(not(feature = "test_vectors"))]
         core.encaps_and_mix::<StaticKem, { StaticKem::SHK_LEN }>(
             rh.scti_mut(),
             peer.get(self).spkt.secret(),
         )?;
+
+        #[cfg(feature = "test_vectors")]
+        self.test_harness.overwrite_scti_and_mix(&mut core, rh.scti_mut(), peer.get(self).spkt.secret());
 
         // RHR6
         core.store_biscuit(self, peer, rh.biscuit_mut())?;
@@ -1810,6 +2011,98 @@ mod test {
 
         // Apply the proper handle_msg operation
         srv.handle_msg(&msgbuf[..msglen], resbuf).unwrap().resp
+    }
+
+    #[test]
+    #[cfg(feature = "test_vectors")]
+    fn deterministic_osk() {
+        rosenpass_sodium::init().unwrap();
+
+        stacker::grow(8 * 1024 * 1024, || {
+            let (mut sk, mut pk) = (ESk::zero(), EPk::zero());
+            EphemeralKem::keygen(sk.secret_mut(), &mut *pk).unwrap();
+            let (mut sidi, mut sidr) = (SessionId::zero(), SessionId::zero());
+            sidi.randomize(); sidr.randomize();
+
+            let psk = SymKey::random();
+            let ((sk_me, pk_me), (sk_they, pk_they)) = (keygen().unwrap(), keygen().unwrap());
+
+            let mut sshk1 = Secret::<{ StaticKem::SHK_LEN }>::zero();
+            let mut sshk2 = Secret::<{ StaticKem::SHK_LEN }>::zero();
+            let mut eshk = Secret::<{ StaticKem::SHK_LEN }>::zero();
+
+            let mut sctr = [0u8; StaticKem::CT_LEN];
+            StaticKem::encaps(sshk1.secret_mut(), &mut sctr, pk_they.secret()).unwrap();
+
+            let mut ecti = [0u8; EphemeralKem::CT_LEN];
+            EphemeralKem::encaps(eshk.secret_mut(), &mut ecti, &pk.value).unwrap();
+
+            let mut scti = [0u8; StaticKem::CT_LEN];
+            StaticKem::encaps(sshk2.secret_mut(), &mut scti, pk_me.secret()).unwrap();
+
+            let biscuit_nonce = XAEADNonce::random();
+            let biscuit_keys = [BiscuitKey::new(), BiscuitKey::new()];
+
+            let test_vector = Rc::new(TestVector::new(sk, pk, sidi, sidr, sshk1, sctr, eshk, ecti, sshk2, scti, biscuit_nonce, HashMap::new(), SymKey::zero()));
+
+            let osk1 = perform_deterministic_exchange(
+                sk_me.clone(),
+                pk_me.clone(),
+                sk_they.clone(),
+                pk_they.clone(),
+                biscuit_keys.clone(),
+                psk.clone(),
+                test_vector.clone());
+
+            let osk2 = perform_deterministic_exchange(
+                sk_me,
+                pk_me,
+                sk_they,
+                pk_they,
+                biscuit_keys,
+                psk,
+                test_vector);
+
+            assert_eq!(osk1.secret(), osk2.secret());
+        });
+    }
+
+    fn perform_deterministic_exchange(
+        ssk_me: SSk,
+        spk_me: SPk,
+        ssk_they: SSk,
+        spk_they: SPk,
+        biscuit_keys: [BiscuitKey; 2],
+        psk: SymKey,
+        test_vector: Rc<TestVector>) -> SymKey {
+
+            const PEER0: PeerPtr = PeerPtr(0);
+
+            let (mut me, mut they) = (
+                CryptoServer::new(ssk_me, spk_me.clone()),
+                CryptoServer::new(ssk_they, spk_they.clone()),
+            );
+
+            me.biscuit_keys = biscuit_keys.clone();
+            they.biscuit_keys = biscuit_keys.clone();
+
+            me.add_peer(Some(psk.clone()), spk_they).unwrap();
+            they.add_peer(Some(psk.clone()), spk_me).unwrap();
+
+            me.set_test_vector(test_vector.clone());
+            they.set_test_vector(test_vector.clone());
+
+            let (mut me_buf, mut they_buf) = (MsgBuf::zero(), MsgBuf::zero());
+
+            let mut maybe_len = Some(me.initiate_handshake(PEER0, me_buf.as_mut_slice()).unwrap());
+
+            while let Some(len) = maybe_len {
+                maybe_len = they.handle_msg(&me_buf[..len], &mut they_buf[..]).unwrap().resp;
+                std::mem::swap(&mut me, &mut they);
+                std::mem::swap(&mut me_buf, &mut they_buf);
+            }
+
+            me.osk(PEER0).unwrap()
     }
 
     fn keygen() -> Result<(SSk, SPk)> {

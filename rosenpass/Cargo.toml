@@ -9,6 +9,9 @@ homepage = "https://rosenpass.eu/"
 repository = "https://github.com/rosenpass/rosenpass"
 readme = "readme.md"
 
+[features]
+test_vectors = []
+
 [[bench]]
 name = "handshake"
 harness = false
